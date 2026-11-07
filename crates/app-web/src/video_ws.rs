@@ -48,11 +48,32 @@ where
     }
 }
 
+/// A socket that presents the watch token (`Sec-WebSocket-Protocol: moq-watch-token.<token>`;
+/// a browser cannot set `Authorization` on a WebSocket and a URL token would be logged) is the
+/// OWNER attending its watch: it counts toward the abandonment watchdog's "someone is here".
+/// An anonymous socket is still served (video presentation is unchanged) but, while the watch
+/// has an owner, it does not keep the watch alive.
 pub async fn get_watch_video<D: SessionDirectory + Send + Sync + 'static>(
     State(handle): State<AppHandle<D>>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| forward(socket, handle))
+) -> axum::response::Response {
+    let offered = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok());
+    let attending = {
+        let mut registry = handle.registry();
+        match registry.owner_idle_for() {
+            // A watch with no grant (not started over HTTP): every socket attends, as before.
+            None => true,
+            Some(_) => {
+                crate::ownership::ws_token(offered).is_some_and(|t| registry.owner_contact(t))
+            }
+        }
+    };
+    ws.protocols([crate::ownership::WS_PROTOCOL])
+        .on_upgrade(move |socket| forward(socket, handle, attending))
+        .into_response()
 }
 
 /// Milliseconds from the operation's `watch.connected` event to now, if it has one: the number
@@ -73,6 +94,7 @@ fn since_connected<D: SessionDirectory + Send + Sync + 'static>(
 async fn forward<D: SessionDirectory + Send + Sync + 'static>(
     mut socket: WebSocket,
     handle: AppHandle<D>,
+    attending: bool,
 ) {
     let lc = handle.lifecycle.clone();
     let waited = std::time::Instant::now();
@@ -109,7 +131,7 @@ async fn forward<D: SessionDirectory + Send + Sync + 'static>(
     // Stage 15.3: this socket is now THE video consumer; an older one (a refreshed page's
     // previous socket) sees it was superseded and closes, so the queue never has two readers.
     let previous_open = handle.liveness.video_sockets_open();
-    let (generation, _open) = handle.liveness.register_video_socket();
+    let (generation, _open) = handle.liveness.register_video_socket(attending);
     if previous_open > 0 {
         lc.event(
             &op,

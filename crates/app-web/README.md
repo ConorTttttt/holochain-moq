@@ -85,7 +85,8 @@ only while a Share or Watch is active - see `src/static/app.js`. No WebSocket, n
 | `POST /api/share` | `{"source": "screen"\|"synthetic", "access": "public"\|"allowed", "allowed_agents": [...]}` - `access` defaults to public; an unknown value is a 400; `allowed_agents` are validated (see "Private sessions") |
 | `POST /api/share/stop` | `request_stop()` then `finish_share()` - only responds once the existing Stage 14E drain has completed |
 | `POST /api/watch` | `{"session_id": "..."}` - Stage 14H.5: starts the **decode-free** watch (`App::start_watch_encoded`); see "Browser video" below |
-| `POST /api/watch/stop` | `request_stop_watch()` then `finish_watch()` - strictly local; never touches the publisher's session (Stage 14G.3 unchanged) |
+| `POST /api/watch/{watch_id}/stop` | needs `Authorization: Bearer <watch_token>`; then `request_stop_watch()` and `finish_watch()` - strictly local; never touches the publisher's session (Stage 14G.3 unchanged). Idempotent: repeating it (or a late one for an older watch) replays that watch's result and never touches a newer watch. See "Watch ownership". |
+| `POST /api/watch/stop` | **removed** (answers `410 Gone`): it stopped whatever watch was active |
 | `GET /api/watch/video` (WebSocket) | Stage 14H.5: the browser video carrier - see "Browser video" below |
 
 Errors are `{"error": "<message>"}` with a normal 4xx/5xx status, using the same
@@ -398,7 +399,7 @@ Browser -> POST /api/watch {session_id}          (no identity anywhere in the re
   mode and allowlist, read from the durable session record (this closes the earlier
   "no access mode on a live share" gap). The session list marks private sessions; a private
   session is still *listed* to everyone - discovery is not authorization.
-* `POST /api/watch/stop` returns `last_error_kind` (`"unauthorized"` / `"expired"`), a typed
+* `POST /api/watch/{watch_id}/stop` returns `last_error_kind` (`"unauthorized"` / `"expired"`), a typed
   classification, so the UI shows a specific message without parsing prose.
 
 **Limitations (found, not hidden):**
@@ -441,7 +442,7 @@ Watch:  Ready -> Watch list (self-refreshing; title, Public/Private, publisher, 
   stays `Live`, its session record stays `Live`, and a second viewer keeps receiving).
   *End session for everyone* (publisher; called *Stop sharing* before Stage 17H) ends the session
   (14E drain first) for everyone, who then get
-  "The publisher ended the session." Distinguished server-side: `POST /api/watch/stop`
+  "The publisher ended the session." Distinguished server-side: `POST /api/watch/{watch_id}/stop`
   returns `last_notice` = `session_ended` | `left`.
 * **Error kinds** (`last_error_kind`, each one an *existing* `WatchError` variant, none
   invented): `unauthorized`, `expired`, `ended`, `not_found`, `publisher_unavailable`,
@@ -703,3 +704,40 @@ Stage 17H adds `ui.test.js` cases, `style.test.js` and `markup.test.js` beside i
 
 This proves the *logic* only - it does not touch a real browser. It does not, on its
 own, demonstrate that browser video works; see "Manual acceptance run" above for that.
+
+
+## Watch ownership
+
+The control surface is loopback-only, but loopback is not "one person": a second tab, a stale
+page, or a restarted dev proxy can all reach it. So a Watch has an **owner**, and only the
+owner can stop it or keep it alive.
+
+* `POST /api/watch` (on success) returns the watch's `watch.watch_id` (a UUID; not secret; also
+  in `GET /api/state`) and, **once**, a top-level `watch_token` (256 random bits, hex). `session_id`
+  is public and is never authority. Only a SHA-256 of the token is kept; it is redacted in
+  `Debug` and never logged. `GET /api/state` never contains it.
+* `POST /api/watch/{watch_id}/stop` + `Authorization: Bearer <watch_token>`:
+
+  | situation | answer |
+  |---|---|
+  | no / malformed credentials | `401` |
+  | unknown watch id | `404` |
+  | known watch, wrong token (incl. a `session_id`, or another watch's token) | `403`, nothing stopped |
+  | the active watch, right token | `200`, watch stopped (same body as before: `last_notice` / `last_error_kind`) |
+  | a watch that already ended, right token | `200`, the *same* body its ending returned (idempotent) - a late or repeated stop can never reach a newer watch |
+
+  The last 16 ended watches are remembered for the replay; the grant also records the watch's
+  `session_id` and a stop refuses (`409`) if the app's active watch is a different session.
+* **Attendance belongs to the owner.** The abandonment watchdog (30 s) now counts only the
+  owner's contact: `GET /api/state` presenting `Authorization: Bearer <watch_token>`, or a video
+  socket presenting the token as a WebSocket sub-protocol (`Sec-WebSocket-Protocol:
+  moq-watch.v1, moq-watch-token.<token>`; browsers cannot set `Authorization` on a socket and a
+  URL token would be logged). An anonymous page that merely keeps polling - a stale tab, a
+  reloaded page that lost its token, an old proxy's leftovers - no longer keeps an orphaned watch
+  alive. Anonymous video sockets are still served; they just do not count as attending. A watch
+  not started over HTTP (in-process use) has no owner and keeps the earlier any-contact rule.
+* Ownership lives in this process, not in a proxy: a dev proxy that restarts forgets nothing, and
+  the page that started the watch can still stop it with the token it holds. If the owner itself
+  disappears (browser killed, token lost), the watchdog ends the watch after its idle limit.
+* Clients keep the token in memory only and should send a best-effort
+  `fetch(..., { keepalive: true })` stop on `pagehide`; the watchdog remains the fallback.

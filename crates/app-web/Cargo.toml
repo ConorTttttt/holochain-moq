@@ -42,9 +42,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Watch ownership (`src/ownership.rs`): unique watch ids, a random bearer token, and its stored hash.
+uuid = { workspace = true }
+sha2 = { workspace = true }
+getrandom = "0.3"
 
 [dev-dependencies]
-uuid = { workspace = true }
 # Stage 15.5: paused-clock tests (`start_paused`) decide timeouts deterministically, with no sleeping.
 tokio = { workspace = true, features = ["test-util"] }
 # Test-only: drive the axum `Router` in-process (no real TCP listener) via

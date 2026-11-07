@@ -999,3 +999,19 @@ test("17C-6. the capability check still asks about the codec alone", async () =>
   assert.deepEqual(await checkVideoSupport(env), { ok: true, checked: true });
   assert.deepEqual(asked, { codec: "av01.0.31M.08" });
 });
+
+test("the watch token is offered as a socket sub-protocol and re-read on every attach", () => {
+  const seen = [];
+  let token = "t1";
+  const w = new VideoWatch({
+    wsUrl: "ws://x/api/watch/video",
+    wsProtocols: () => ["moq-watch.v1", `moq-watch-token.${token}`],
+    createWebSocket: (url, protocols) => { seen.push(protocols); return { close() {} }; },
+    createDecoder: () => ({ configure() {}, decode() {}, close() {}, state: "configured" }),
+    makeChunk: (x) => x,
+  });
+  w._attachSocket();
+  token = "t2";
+  w._attachSocket();
+  assert.deepEqual(seen, [["moq-watch.v1", "moq-watch-token.t1"], ["moq-watch.v1", "moq-watch-token.t2"]]);
+});

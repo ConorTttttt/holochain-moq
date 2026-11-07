@@ -47,6 +47,8 @@ let autoStopping = false;
 const videoWatch = new HolochainMoqVideo.VideoWatch({
   canvas: el("watch-canvas"),
   wsUrl: `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/watch/video`,
+  // The watch token proves this page started the watch, so this socket counts as attending it.
+  wsProtocols: () => (watchCred ? ["moq-watch.v1", `moq-watch-token.${watchCred.token}`] : undefined),
   onStatus: renderVideoStatus,
   // An unexpectedly closed video socket is re-attached only while the server still reports a
   // running watch (never to a session that has ended).
@@ -194,10 +196,18 @@ function clearError() {
   el("error-actions").classList.add("hidden");
 }
 
+// What `POST /api/watch` returned: this watch's id and its secret bearer token. Held in memory
+// only. Presenting it on state polls keeps the watch attended; it is required to stop the watch.
+let watchCred = null;
+
 async function api(method, path, body) {
+  const headers = body ? { "content-type": "application/json" } : {};
+  if (watchCred && (path === "/api/state" || path.startsWith("/api/watch/"))) {
+    headers.authorization = `Bearer ${watchCred.token}`;
+  }
   const res = await fetch(path, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
@@ -607,6 +617,7 @@ async function startWatch(session) {
   selectedSession = session; // for display only: title/publisher/access of what is being watched
   try {
     const state = await api("POST", "/api/watch", { session_id: session.session_id });
+    watchCred = state.watch_token && state.watch ? { id: state.watch.watch_id, token: state.watch_token } : null;
     render(state);
   } catch (e) {
     selectedSession = null;
@@ -617,7 +628,14 @@ async function startWatch(session) {
 async function stopWatch() {
   clearError();
   try {
-    const state = await api("POST", "/api/watch/stop");
+    if (!watchCred) {
+      // This page did not start the running watch (e.g. it was reloaded): it cannot stop it.
+      // The server leaves a watch nobody owns-and-attends after its idle limit.
+      throw new Error("this page does not own the running watch; it will end on its own");
+    }
+    const cred = watchCred;
+    const state = await api("POST", `/api/watch/${encodeURIComponent(cred.id)}/stop`);
+    watchCred = null;
     render(state);
   } catch (e) {
     showError(errText(e), String((e && e.message) || e));

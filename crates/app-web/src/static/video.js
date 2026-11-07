@@ -529,6 +529,9 @@
       onStatus,
       codec = DEFAULT_CODEC,
       wsUrl,
+      // Sub-protocols offered on the socket (the watch token travels there; see app-web's
+      // `ownership`). A function so it is read at each (re)attach.
+      wsProtocols,
       createWebSocket,
       createDecoder,
       makeChunk,
@@ -560,10 +563,11 @@
       this.ctx = this.canvas ? this.canvas.getContext("2d") : null;
       this.codec = codec;
       this.wsUrl = wsUrl;
+      this.wsProtocols = wsProtocols || (() => undefined);
       this.createWebSocket =
         createWebSocket ||
-        function (url) {
-          const ws = new WebSocket(url);
+        function (url, protocols) {
+          const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
           ws.binaryType = "arraybuffer";
           return ws;
         };
@@ -662,7 +666,7 @@
     /// invisible to it; only if the *socket itself* closes unexpectedly is it re-attached (see
     /// `_onSocketClosed`), against the server-side watch that is still there.
     _attachSocket() {
-      const ws = this.createWebSocket(this.wsUrl);
+      const ws = this.createWebSocket(this.wsUrl, this.wsProtocols());
       this.ws = ws;
       ws.onmessage = (ev) => {
         if (ws !== this.ws) return; // a socket we have already replaced or closed
