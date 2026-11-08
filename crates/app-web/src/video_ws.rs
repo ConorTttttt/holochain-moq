@@ -152,7 +152,7 @@ async fn forward<D: SessionDirectory + Send + Sync + 'static>(
 
     // Stage 15.3: this socket is now THE video consumer; an older one (a refreshed page's
     // previous socket) sees it was superseded and closes, so the queue never has two readers.
-    let previous_open = handle.liveness.video_sockets_open();
+    let previous_open = handle.liveness.video_sockets_open().saturating_sub(1); // excluding this socket (registered above)
     if previous_open > 0 {
         lc.event(
             &op,
