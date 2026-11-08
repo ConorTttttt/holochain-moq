@@ -48,31 +48,32 @@ where
     }
 }
 
-/// A socket that presents the watch token (`Sec-WebSocket-Protocol: moq-watch-token.<token>`;
-/// a browser cannot set `Authorization` on a WebSocket and a URL token would be logged) is the
-/// OWNER attending its watch: it counts toward the abandonment watchdog's "someone is here".
-/// An anonymous socket is still served (video presentation is unchanged) but, while the watch
-/// has an owner, it does not keep the watch alive.
+/// Admission for the browser video socket. The socket carries decoded-free (private) video, so
+/// it is authenticated BEFORE the upgrade: the client must offer the active watch's token as
+/// `Sec-WebSocket-Protocol: moq-watch.v1, moq-watch-token.<token>` (a browser cannot set
+/// `Authorization` on a WebSocket, and a URL token would be logged). Anything else - no token,
+/// malformed, wrong, a previous watch's, or no active watch - is refused with 401/403 and
+/// never reaches the shared video queue or the socket-supersession logic. Host/Origin checks
+/// (`guard`) still run first but are not authentication.
 pub async fn get_watch_video<D: SessionDirectory + Send + Sync + 'static>(
     State(handle): State<AppHandle<D>>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
+    use axum::http::StatusCode;
     let offered = headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok());
-    let attending = {
-        let mut registry = handle.registry();
-        match registry.owner_idle_for() {
-            // A watch with no grant (not started over HTTP): every socket attends, as before.
-            None => true,
-            Some(_) => {
-                crate::ownership::ws_token(offered).is_some_and(|t| registry.owner_contact(t))
-            }
-        }
+    let Some(token) =
+        crate::ownership::ws_token(offered).filter(|t| crate::ownership::is_well_formed(t))
+    else {
+        return (StatusCode::UNAUTHORIZED, "watch token required").into_response();
+    };
+    let Some(watch_id) = handle.registry().admit(token) else {
+        return (StatusCode::FORBIDDEN, "not the owner of the active watch").into_response();
     };
     ws.protocols([crate::ownership::WS_PROTOCOL])
-        .on_upgrade(move |socket| forward(socket, handle, attending))
+        .on_upgrade(move |socket| forward(socket, handle, watch_id))
         .into_response()
 }
 
@@ -94,7 +95,7 @@ fn since_connected<D: SessionDirectory + Send + Sync + 'static>(
 async fn forward<D: SessionDirectory + Send + Sync + 'static>(
     mut socket: WebSocket,
     handle: AppHandle<D>,
-    attending: bool,
+    watch_id: String,
 ) {
     let lc = handle.lifecycle.clone();
     let waited = std::time::Instant::now();
@@ -118,6 +119,27 @@ async fn forward<D: SessionDirectory + Send + Sync + 'static>(
         .await;
         return;
     };
+    // The token was checked before the upgrade; the watch may have ended or been replaced since.
+    // Re-check while REGISTERING (same registry lock), so a socket admitted for watch A can never
+    // become the consumer of watch B's queue, nor register after A ended.
+    let registered = {
+        let registry = handle.registry();
+        registry
+            .is_current(&watch_id)
+            .then(|| handle.liveness.register_video_socket())
+    };
+    let Some((generation, _open)) = registered else {
+        tracing::warn!(target: "lifecycle", "ws.rejected: the watch ended before the socket was admitted");
+        let _ = send_within(
+            SEND_STALL_LIMIT,
+            socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 4001,
+                reason: "watch ended".into(),
+            }))),
+        )
+        .await;
+        return;
+    };
     lc.event(
         &op,
         "ws.requested",
@@ -131,7 +153,6 @@ async fn forward<D: SessionDirectory + Send + Sync + 'static>(
     // Stage 15.3: this socket is now THE video consumer; an older one (a refreshed page's
     // previous socket) sees it was superseded and closes, so the queue never has two readers.
     let previous_open = handle.liveness.video_sockets_open();
-    let (generation, _open) = handle.liveness.register_video_socket(attending);
     if previous_open > 0 {
         lc.event(
             &op,
@@ -180,6 +201,20 @@ async fn forward<D: SessionDirectory + Send + Sync + 'static>(
                 }
             }
             _ = interval.tick() => {
+                // The socket is bound to the watch it was admitted for: once that watch is no
+                // longer the active one (stopped, abandoned, replaced) no further frame leaves,
+                // not even ones already queued.
+                if !handle.registry().is_current(&watch_id) {
+                    let _ = send_within(
+                        SEND_STALL_LIMIT,
+                        socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 4001,
+                            reason: "watch ended".into(),
+                        }))),
+                    )
+                    .await;
+                    break 'serve "watch_not_current";
+                }
                 for event in queue.drain() {
                     let mut forwarded: Option<(u64, usize)> = None;
                     let (frame, is_media) = match event {

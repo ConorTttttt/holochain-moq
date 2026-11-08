@@ -734,8 +734,17 @@ owner can stop it or keep it alive.
   moq-watch.v1, moq-watch-token.<token>`; browsers cannot set `Authorization` on a socket and a
   URL token would be logged). An anonymous page that merely keeps polling - a stale tab, a
   reloaded page that lost its token, an old proxy's leftovers - no longer keeps an orphaned watch
-  alive. Anonymous video sockets are still served; they just do not count as attending. A watch
-  not started over HTTP (in-process use) has no owner and keeps the earlier any-contact rule.
+  alive. A watch not started over HTTP (in-process use) has no owner, so it has no video socket
+  (see below) and keeps the earlier any-contact watchdog rule.
+* **The video socket is authenticated before the upgrade.** `GET /api/watch/video` requires the
+  active watch's token in `Sec-WebSocket-Protocol` (as above). Missing or malformed -> `401`;
+  well-formed but not the active watch's (wrong, a previous watch's, a stopped watch's, or no
+  active watch) -> `403`; in both cases nothing is upgraded, the shared video queue is never
+  touched and the current viewer's socket is not superseded. The socket is bound to the
+  `watch_id` it was admitted for: admission is re-checked, under the same registry lock that
+  retires a watch, when the socket registers, and on every drain tick, so a socket never outlives
+  or follows its watch. Only an authenticated socket can supersede (reconnect) an older one.
+  Host/Origin checks still run first but are not authentication.
 * Ownership lives in this process, not in a proxy: a dev proxy that restarts forgets nothing, and
   the page that started the watch can still stop it with the token it holds. If the owner itself
   disappears (browser killed, token lost), the watchdog ends the watch after its idle limit.

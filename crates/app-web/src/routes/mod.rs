@@ -122,18 +122,14 @@ impl Liveness {
     /// Register a new video consumer: returns its generation and a guard that keeps it
     /// counted as open. Any older consumer sees its generation is no longer current.
     ///
-    /// `attending`: whether this socket counts as someone attending the watch. Every socket is
-    /// the current consumer (supersession), but only an owner's keeps the watchdog at bay.
-    pub(crate) fn register_video_socket(
-        self: &Arc<Self>,
-        attending: bool,
-    ) -> (u64, VideoSocketGuard) {
+    /// Only an AUTHENTICATED socket (valid token for the active watch) may ever reach this;
+    /// registering is what supersedes the previous consumer, so it is the admission boundary
+    /// (`video_ws::get_watch_video` + the re-check in `forward`).
+    pub(crate) fn register_video_socket(self: &Arc<Self>) -> (u64, VideoSocketGuard) {
         use std::sync::atomic::Ordering::SeqCst;
         let generation = self.ws_generation.fetch_add(1, SeqCst) + 1;
-        if attending {
-            self.ws_open.fetch_add(1, SeqCst);
-        }
-        (generation, VideoSocketGuard(self.clone(), attending))
+        self.ws_open.fetch_add(1, SeqCst);
+        (generation, VideoSocketGuard(self.clone()))
     }
 
     pub(crate) fn is_current_video_socket(&self, generation: u64) -> bool {
@@ -141,15 +137,13 @@ impl Liveness {
     }
 }
 
-pub(crate) struct VideoSocketGuard(Arc<Liveness>, bool);
+pub(crate) struct VideoSocketGuard(Arc<Liveness>);
 
 impl Drop for VideoSocketGuard {
     fn drop(&mut self) {
-        if self.1 {
-            self.0
-                .ws_open
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.0
+            .ws_open
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.0.touch();
     }
 }

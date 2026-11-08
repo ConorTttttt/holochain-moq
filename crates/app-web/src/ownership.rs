@@ -173,6 +173,27 @@ impl WatchRegistry {
             .map(|g| g.last_owner_contact.elapsed())
     }
 
+    /// Video-socket admission: does `token` belong to the ACTIVE watch? On success returns that
+    /// watch's id (the identity the socket is bound to for its whole life) and counts as owner
+    /// contact. Fails closed: no active grant, a different watch's token, or any other string
+    /// all yield `None`. Comparison is on SHA-256 hashes, constant time.
+    pub fn admit(&mut self, token: &str) -> Option<String> {
+        let g = self.current.as_mut()?;
+        if !same(&g.token_hash, &hash(token)) {
+            return None;
+        }
+        g.last_owner_contact = Instant::now();
+        Some(g.watch_id.clone())
+    }
+
+    /// Is `watch_id` still the active watch? A socket admitted for it must stop receiving
+    /// frames the moment this turns false (stop, watchdog, replacement).
+    pub fn is_current(&self, watch_id: &str) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|g| g.watch_id == watch_id)
+    }
+
     pub fn check_stop(&self, watch_id: &str, token: &str) -> StopCheck {
         let presented = hash(token);
         if let Some(g) = &self.current {
@@ -219,6 +240,15 @@ pub fn bearer(header: Option<&str>) -> Option<&str> {
 /// set an `Authorization` header on a WebSocket, and a token in the URL would be logged).
 pub const WS_PROTOCOL: &str = "moq-watch.v1";
 pub const WS_TOKEN_PREFIX: &str = "moq-watch-token.";
+
+/// A token this service could have issued: exactly 64 lowercase hex digits. Anything else is
+/// rejected as malformed without being compared.
+pub fn is_well_formed(token: &str) -> bool {
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// The token a client offered in `Sec-WebSocket-Protocol`, if any.
 pub fn ws_token(header: Option<&str>) -> Option<&str> {
@@ -301,6 +331,32 @@ mod tests {
             r.end_current(Value::Null);
         }
         assert_eq!(r.check_stop(&first, t.as_str()), StopCheck::Unknown);
+    }
+
+    #[test]
+    fn admission_is_bound_to_the_active_watch_only() {
+        let mut r = WatchRegistry::default();
+        assert_eq!(r.admit(&"a".repeat(64)), None, "no watch: fail closed");
+        let (id1, t1) = r.issue("s1");
+        assert_eq!(r.admit(t1.as_str()), Some(id1.clone()));
+        assert_eq!(r.admit(&"0".repeat(64)), None);
+        assert_eq!(r.admit("s1"), None, "session_id is not a credential");
+        assert!(r.is_current(&id1));
+        r.end_current(Value::Null);
+        assert!(!r.is_current(&id1));
+        assert_eq!(r.admit(t1.as_str()), None, "ended watch's token is dead");
+        let (id2, t2) = r.issue("s1");
+        assert_eq!(r.admit(t1.as_str()), None, "previous watch's token");
+        assert_eq!(r.admit(t2.as_str()), Some(id2.clone()));
+        assert!(!r.is_current(&id1));
+    }
+
+    #[test]
+    fn token_format_check() {
+        assert!(is_well_formed(&"ab12".repeat(16)));
+        assert!(!is_well_formed("short"));
+        assert!(!is_well_formed(&"AB12".repeat(16)));
+        assert!(!is_well_formed(&"zz".repeat(32)));
     }
 
     #[test]

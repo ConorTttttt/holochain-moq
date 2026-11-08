@@ -599,9 +599,7 @@ async fn watch_video_websocket_delivers_a_real_epoch_and_keyframe() {
         let _ = axum::serve(listener, r).await;
     });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch/video"))
-        .await
-        .expect("connecting the video websocket");
+    let mut ws = private_sessions::ws_connect_as(&handle, addr).await;
 
     // Note: `EncodedVideoSink::epoch_started` (like `VideoSink::epoch_started`) is only
     // called on a *reconnect* (`StreamEvent::Reconnected`) - never for the initial
@@ -710,9 +708,7 @@ async fn watch_video_websocket_completes_the_close_handshake_when_the_client_clo
         let _ = axum::serve(listener, r).await;
     });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch/video"))
-        .await
-        .expect("connecting the video websocket");
+    let mut ws = private_sessions::ws_connect_as(&handle, addr).await;
 
     // Wait for at least one real message so the server's forwarding loop is definitely
     // past its initial setup (not still resolving `encoded_video_queue()`), then close
@@ -837,9 +833,7 @@ async fn watch_video_websocket_survives_a_publisher_outage_and_ends_cleanly() {
         }
     });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{http_addr}/api/watch/video"))
-        .await
-        .expect("connecting the video websocket");
+    let mut ws = private_sessions::ws_connect_as(&handle, http_addr).await;
 
     // Everything received, in order, as `(opcode, epoch, is_keyframe)`.
     let mut log: Vec<(u8, u32, bool)> = Vec::new();
@@ -1157,16 +1151,6 @@ mod private_sessions {
         .expect("no keyframe arrived");
     }
 
-    pub(super) async fn ws_connect(
-        addr: SocketAddr,
-    ) -> impl futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin
-    {
-        tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch/video"))
-            .await
-            .expect("connecting the video websocket")
-            .0
-    }
-
     /// Connect the browser video socket AS THE OWNER of the watch the last `POST /api/watch`
     /// started: the token travels in `Sec-WebSocket-Protocol`, exactly as the browser does.
     pub(super) async fn ws_connect_as<
@@ -1174,7 +1158,7 @@ mod private_sessions {
     >(
         handle: &AppHandle<D>,
         addr: SocketAddr,
-    ) -> impl futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
     {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let (_id, token) = handle
@@ -2619,7 +2603,7 @@ mod observability {
         poll_event(&v, &end.id, "ws.closed").await;
         let end = v.handle.lifecycle.snapshot(&end.id).unwrap();
         assert!(
-            has_detail(&end, "ws.closed", "queue_inactive"),
+            has_detail(&end, "ws.closed", "watch_not_current"),
             "{:?}",
             detail_of(&end, "ws.closed")
         );
@@ -3630,14 +3614,17 @@ mod hardening {
             Err(Error::Http(res)) => assert_eq!(res.status(), 403),
             other => panic!("the cross-origin websocket handshake must be refused, got {other:?}"),
         }
-        // The same handshake from the app's own origin is not refused by the guard (it is
-        // closed by the route itself, because there is no active watch).
+        // The same handshake from the app's own origin passes the Host/Origin guard; the route
+        // itself then refuses it (401: no watch token) - the guard is not authentication.
         let mut ok = format!("ws://{addr}/api/watch/video")
             .into_client_request()
             .unwrap();
         ok.headers_mut()
             .insert("origin", format!("http://{addr}").parse().unwrap());
-        assert!(tokio_tungstenite::connect_async(ok).await.is_ok());
+        match tokio_tungstenite::connect_async(ok).await {
+            Err(Error::Http(res)) => assert_eq!(res.status(), 401),
+            other => panic!("a same-origin socket without a token must get 401, got {other:?}"),
+        }
         server.abort();
     }
 
@@ -5078,11 +5065,13 @@ mod media_quality {
 
 mod ownership {
     use super::private_sessions::{
-        first_keyframe, keypair, publisher, serve, viewer, ws_connect, ws_connect_as,
+        first_keyframe, keypair, publisher, serve, viewer, ws_connect_as,
     };
     use super::*;
+    use futures::StreamExt;
     use holochain_moq_app::AccessConfig;
     use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     /// Start a watch over HTTP and return its `(watch_id, watch_token)` from the response body
     /// - the only place the token is ever delivered.
@@ -5302,6 +5291,225 @@ mod ownership {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    type WsErr = tokio_tungstenite::tungstenite::Error;
+
+    /// Try to open the video socket offering `token` (None = no sub-protocol at all). `Err` is
+    /// the HTTP status the server refused the UPGRADE with.
+    async fn try_ws(
+        addr: SocketAddr,
+        token: Option<&str>,
+    ) -> Result<impl futures::Stream<Item = Result<WsMessage, WsErr>> + Unpin, StatusCode> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}/api/watch/video")
+            .into_client_request()
+            .unwrap();
+        if let Some(t) = token {
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                format!("moq-watch.v1, moq-watch-token.{t}")
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(WsErr::Http(res)) => Err(res.status()),
+            Err(e) => panic!("unexpected websocket error: {e:?}"),
+        }
+    }
+
+    /// Frames received in `window`, and whether the socket was closed/ended by the server.
+    async fn drain(
+        ws: &mut (impl futures::Stream<Item = Result<WsMessage, WsErr>> + Unpin),
+        window: Duration,
+    ) -> (usize, Option<u16>, bool) {
+        let mut frames = 0;
+        let mut code = None;
+        let ended = tokio::time::timeout(window, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Binary(_))) => frames += 1,
+                    Some(Ok(WsMessage::Close(Some(f)))) => code = Some(u16::from(f.code)),
+                    Some(Ok(_)) => {}
+                    _ => return,
+                }
+            }
+        })
+        .await
+        .is_ok();
+        (frames, code, ended)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_video_socket_is_refused_before_upgrade_without_the_active_watchs_token() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "ws-auth", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+
+        // No active watch: fail closed, whatever is presented.
+        assert_eq!(
+            try_ws(addr, None).await.err(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            try_ws(addr, Some(&"a".repeat(64))).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        assert_eq!(
+            try_ws(addr, None).await.err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "no token"
+        );
+        for malformed in ["x", "not-hex", &"A".repeat(64), &sid.to_string()] {
+            assert_eq!(
+                try_ws(addr, Some(malformed)).await.err(),
+                Some(StatusCode::UNAUTHORIZED),
+                "malformed {malformed}"
+            );
+        }
+        assert_eq!(
+            try_ws(addr, Some(&"0".repeat(64))).await.err(),
+            Some(StatusCode::FORBIDDEN),
+            "well-formed but wrong"
+        );
+        let mut ok = try_ws(addr, Some(&tok))
+            .await
+            .expect("the owner is admitted");
+        first_keyframe(&mut ok).await;
+        assert_eq!(v.handle.liveness.video_sockets_open(), 1);
+
+        // Expired: once the watch is stopped its token is dead.
+        drop(ok);
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        assert_eq!(
+            try_ws(addr, Some(&tok)).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // Previous watch's token cannot attach to a newer watch.
+        let (_id2, tok2) = start(&v, &sid.to_string()).await;
+        assert_ne!(tok, tok2);
+        assert_eq!(
+            try_ws(addr, Some(&tok)).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert!(try_ws(addr, Some(&tok2)).await.is_ok());
+
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unauthorised_sockets_get_no_frames_and_cannot_disturb_the_owner() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        // A PRIVATE session the viewer is allowed into.
+        let (mut publ, sid) = publisher(
+            &dir,
+            &alice,
+            "ws-private",
+            AccessConfig::allowed(vec![bob.clone()]).unwrap(),
+        )
+        .await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let mut owner = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut owner).await;
+        let generation_before = v.handle.liveness.video_sockets_open();
+
+        // Concurrent attackers (anonymous, wrong token, a session id) alongside the owner.
+        let attackers = (0..8).map(|i| {
+            tokio::spawn(async move {
+                let wrong = "1".repeat(64);
+                match i % 3 {
+                    0 => try_ws(addr, None).await.err(),
+                    1 => try_ws(addr, Some(&wrong)).await.err(),
+                    _ => try_ws(addr, Some("00000000-0000-0000-0000-000000000000"))
+                        .await
+                        .err(),
+                }
+            })
+        });
+        for a in futures::future::join_all(attackers).await {
+            let status = a.unwrap().expect("an unauthorised socket must be refused");
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+                "{status}"
+            );
+        }
+        // The owner is not superseded, still registered, and keeps receiving the stream.
+        assert_eq!(v.handle.liveness.video_sockets_open(), generation_before);
+        let (frames, code, ended) = drain(&mut owner, Duration::from_secs(2)).await;
+        assert!(frames > 0, "the owner kept receiving frames");
+        assert!(
+            !ended && code.is_none(),
+            "the owner was not closed ({code:?})"
+        );
+
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_owner_can_reconnect_and_only_then_is_the_old_socket_replaced() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "ws-reconnect", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let mut old = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut old).await;
+        assert!(try_ws(addr, None).await.is_err());
+        let mut fresh = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut fresh).await;
+        let (_frames, code, ended) = drain(&mut old, Duration::from_secs(5)).await;
+        assert!(ended, "the superseded owner socket was closed");
+        assert_eq!(code, Some(4009));
+        assert_eq!(v.handle.liveness.video_sockets_open(), 1);
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_socket_stops_receiving_the_moment_its_watch_ends_and_never_follows_a_newer_one() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "ws-ends", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let mut a = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut a).await;
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        // A new watch begins at once; the old socket must not become its consumer.
+        let (_id2, tok2) = start(&v, &sid.to_string()).await;
+        let mut b = try_ws(addr, Some(&tok2)).await.unwrap();
+        first_keyframe(&mut b).await;
+        let (_frames, _code, ended) = drain(&mut a, Duration::from_secs(5)).await;
+        assert!(ended, "the old watch's socket was closed");
+        // ...and no frame of the new watch ever went to it: B still receives the stream.
+        let (frames, _c, b_ended) = drain(&mut b, Duration::from_secs(2)).await;
+        assert!(frames > 0 && !b_ended);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn only_the_owners_video_socket_counts_as_attending() {
         let (_ak, alice) = keypair(1);
@@ -5312,9 +5520,8 @@ mod ownership {
         let (addr, server) = serve(&v.router).await;
         let (id, tok) = start(&v, &sid.to_string()).await;
 
-        // A foreign page's socket is served (presentation unchanged) but does not attend.
-        let mut anon = ws_connect(addr).await;
-        first_keyframe(&mut anon).await;
+        // A foreign page's socket is refused outright; it never attends.
+        assert!(try_ws(addr, None).await.is_err());
         assert_eq!(v.handle.liveness.video_sockets_open(), 0);
         // The owner's socket does.
         let mut owner = ws_connect_as(&v.handle, addr).await;
@@ -5322,7 +5529,6 @@ mod ownership {
         assert_eq!(v.handle.liveness.video_sockets_open(), 1);
 
         drop(owner);
-        drop(anon);
         assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
         server.abort();
         publ.request_stop();
