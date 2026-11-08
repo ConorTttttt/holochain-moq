@@ -38,6 +38,9 @@ pub struct AppHandle<D: SessionDirectory + Send + Sync + 'static> {
     /// Stage 15.4: the app's lifecycle recorder, cloned out so a request can record events
     /// (including how long it waited for the app lock) before it holds the lock.
     pub lifecycle: Arc<holochain_moq_app::lifecycle::Lifecycle>,
+    /// Who owns the active watch (its id, token hash, and owner-attendance clock); see
+    /// [`crate::ownership`]. A std mutex, held only for short, non-awaiting sections.
+    pub watches: Arc<std::sync::Mutex<crate::ownership::WatchRegistry>>,
 }
 
 impl<D: SessionDirectory + Send + Sync + 'static> Clone for AppHandle<D> {
@@ -46,6 +49,7 @@ impl<D: SessionDirectory + Send + Sync + 'static> Clone for AppHandle<D> {
             app: self.app.clone(),
             liveness: self.liveness.clone(),
             lifecycle: self.lifecycle.clone(),
+            watches: self.watches.clone(),
         }
     }
 }
@@ -57,7 +61,14 @@ impl<D: SessionDirectory + Send + Sync + 'static> AppHandle<D> {
             app: Arc::new(Mutex::new(app)),
             liveness: Arc::new(Liveness::new()),
             lifecycle,
+            watches: Arc::default(),
         }
+    }
+
+    /// The watch registry. A poisoned lock only means another request panicked mid-update of
+    /// plain bookkeeping; the data is still usable.
+    pub(crate) fn registry(&self) -> std::sync::MutexGuard<'_, crate::ownership::WatchRegistry> {
+        self.watches.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -110,6 +121,10 @@ impl Liveness {
 
     /// Register a new video consumer: returns its generation and a guard that keeps it
     /// counted as open. Any older consumer sees its generation is no longer current.
+    ///
+    /// Only an AUTHENTICATED socket (valid token for the active watch) may ever reach this;
+    /// registering is what supersedes the previous consumer, so it is the admission boundary
+    /// (`video_ws::get_watch_video` + the re-check in `forward`).
     pub(crate) fn register_video_socket(self: &Arc<Self>) -> (u64, VideoSocketGuard) {
         use std::sync::atomic::Ordering::SeqCst;
         let generation = self.ws_generation.fetch_add(1, SeqCst) + 1;
@@ -148,7 +163,17 @@ pub fn spawn_abandoned_watch_watchdog<D: SessionDirectory + Send + Sync + 'stati
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tick).await;
-            if handle.liveness.video_sockets_open() > 0 || handle.liveness.since_seen() < idle {
+            // Attendance is the OWNER's: a state poll or video socket that presents the watch's
+            // token. A page that merely keeps polling (a stale tab, a reloaded page that lost
+            // its token, a restarted proxy's leftovers) must not keep an orphaned watch alive.
+            // A watch with no grant (not started through `POST /api/watch`) keeps the older
+            // any-page-contact rule.
+            let owner_idle = handle.registry().owner_idle_for();
+            let attended = match owner_idle {
+                Some(since_owner) => since_owner < idle,
+                None => handle.liveness.since_seen() < idle,
+            };
+            if handle.liveness.video_sockets_open() > 0 || attended {
                 continue;
             }
             let mut app = handle.app.lock().await;
@@ -157,8 +182,10 @@ pub fn spawn_abandoned_watch_watchdog<D: SessionDirectory + Send + Sync + 'stati
                 // decision used (Stage 15.4). The policy itself (`idle`) is unchanged.
                 if let Some(op) = app.watch_op() {
                     let detail = format!(
-                        "no page contact for {}ms (limit {}ms), video sockets open: {}, watch state: {:?}",
-                        handle.liveness.since_seen().as_millis(),
+                        "no owner contact for {}ms (limit {}ms), video sockets open: {}, watch state: {:?}",
+                        owner_idle
+                            .unwrap_or_else(|| handle.liveness.since_seen())
+                            .as_millis(),
                         idle.as_millis(),
                         handle.liveness.video_sockets_open(),
                         app.watch_connection_state(),
@@ -173,7 +200,9 @@ pub fn spawn_abandoned_watch_watchdog<D: SessionDirectory + Send + Sync + 'stati
                 }
                 tracing::warn!("no page is attending this watch; leaving it");
                 app.request_stop_watch();
-                let _ = app.finish_watch().await;
+                let end = app.finish_watch().await;
+                // The owner's token stays valid for repeats: a later stop replays this result.
+                watch::end_current_watch(&handle, &app, end);
             }
         }
     })
@@ -296,6 +325,34 @@ impl ApiError {
         }
     }
 
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            message: message.into(),
+        }
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -403,7 +460,13 @@ pub fn router_with_policy<D: SessionDirectory + Send + Sync + 'static>(
         .route("/api/share", post(share::post_share::<D>))
         .route("/api/share/stop", post(share::post_share_stop::<D>))
         .route("/api/watch", post(watch::post_watch::<D>))
-        .route("/api/watch/stop", post(watch::post_watch_stop::<D>))
+        // Scoped to ONE watch and authorised by that watch's bearer token (see `ownership`).
+        .route(
+            "/api/watch/{watch_id}/stop",
+            post(watch::post_watch_stop::<D>),
+        )
+        // The old unscoped stop ended whatever watch was active; it is gone.
+        .route("/api/watch/stop", post(watch::post_watch_stop_removed))
         .route("/api/diagnostics", get(state::get_diagnostics::<D>))
         .route("/api/media/timings", get(state::get_media_timings::<D>))
         .route(

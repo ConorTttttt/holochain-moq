@@ -48,6 +48,11 @@ pub struct AppStateView {
     /// Stage 15.4: where the active operation is (op id, phase, phase age). Compact on purpose;
     /// the history is `GET /api/diagnostics`.
     pub diag: Option<crate::diag::DiagView>,
+    /// The bearer secret of the watch this response just started: present ONLY in the
+    /// `POST /api/watch` response, never in `GET /api/state`, and redacted in `Debug`. Whoever
+    /// holds it owns that watch (see `ownership`); `session_id` is not authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch_token: Option<crate::ownership::WatchToken>,
 }
 
 /// Classify a stop/finish error for [`AppStateView::last_error_kind`]. Downcasts to the
@@ -102,7 +107,21 @@ impl AppStateView {
             last_error_kind: None,
             last_notice: None,
             diag: None,
+            watch_token: None,
         }
+    }
+
+    /// Stamp the active watch's identity (non-secret) onto the view.
+    pub fn with_watch_id(mut self, watch_id: Option<&str>) -> Self {
+        if let (Some(w), Some(id)) = (self.watch.as_mut(), watch_id) {
+            w.watch_id = Some(id.to_string());
+        }
+        self
+    }
+
+    pub fn with_watch_token(mut self, token: crate::ownership::WatchToken) -> Self {
+        self.watch_token = Some(token);
+        self
     }
 
     pub fn with_diag(mut self, diag: Option<crate::diag::DiagView>) -> Self {
@@ -202,6 +221,9 @@ fn watching_state_label(s: WatchingState) -> &'static str {
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct WatchView {
+    /// Unique per watch attempt (non-secret identity, shared by `POST /api/watch`, `GET
+    /// /api/state` and the scoped stop URL). `None` for a watch not started over HTTP.
+    pub watch_id: Option<String>,
     pub state: &'static str,
     pub reconnect_attempt: Option<u32>,
     pub session_id: Option<String>,
@@ -220,6 +242,7 @@ impl WatchView {
     ) -> Self {
         let progress = app.watch_progress();
         Self {
+            watch_id: None,
             state: watching_state_label(state),
             reconnect_attempt: match state {
                 WatchingState::Reconnecting { attempt } => Some(attempt),

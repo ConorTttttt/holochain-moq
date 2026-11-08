@@ -10,6 +10,7 @@
 mod config;
 mod diag;
 mod guard;
+mod ownership;
 mod routes;
 #[cfg(test)]
 mod tests;

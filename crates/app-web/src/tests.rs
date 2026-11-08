@@ -72,6 +72,34 @@ async fn get(router: &axum::Router, path: &str) -> axum::response::Response {
         .unwrap()
 }
 
+/// POST with `Authorization: Bearer <token>` (the scoped watch stop).
+async fn post_bearer(router: &axum::Router, path: &str, token: &str) -> axum::response::Response {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Stop the watch as its owner (the credentials the last `POST /api/watch` issued).
+async fn stop_as_owner<D: holochain_moq_node::SessionDirectory + Send + Sync + 'static>(
+    handle: &AppHandle<D>,
+    router: &axum::Router,
+) -> axum::response::Response {
+    let (id, token) = handle
+        .registry()
+        .last_issued()
+        .expect("no watch was granted");
+    post_bearer(router, &format!("/api/watch/{id}/stop"), &token).await
+}
+
 async fn post(router: &axum::Router, path: &str, body: Value) -> axum::response::Response {
     router
         .clone()
@@ -326,7 +354,8 @@ async fn watch_stop_returns_to_ready_without_ending_the_publisher_session() {
         .await
         .unwrap();
 
-    let r = router(AppHandle::new(viewer));
+    let handle = AppHandle::new(viewer);
+    let r = router(handle.clone());
     // Give the background task a moment to actually connect before stopping it.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -341,7 +370,9 @@ async fn watch_stop_returns_to_ready_without_ending_the_publisher_session() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    let res = post(&r, "/api/watch/stop", json!({})).await;
+    // This watch was started in-process (not over HTTP), so mint its grant here.
+    let (watch_id, token) = handle.registry().issue(&session_id.to_string());
+    let res = post_bearer(&r, &format!("/api/watch/{watch_id}/stop"), token.as_str()).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(json_body(res).await["state"], "ready");
 
@@ -568,9 +599,7 @@ async fn watch_video_websocket_delivers_a_real_epoch_and_keyframe() {
         let _ = axum::serve(listener, r).await;
     });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch/video"))
-        .await
-        .expect("connecting the video websocket");
+    let mut ws = private_sessions::ws_connect_as(&handle, addr).await;
 
     // Note: `EncodedVideoSink::epoch_started` (like `VideoSink::epoch_started`) is only
     // called on a *reconnect* (`StreamEvent::Reconnected`) - never for the initial
@@ -679,9 +708,7 @@ async fn watch_video_websocket_completes_the_close_handshake_when_the_client_clo
         let _ = axum::serve(listener, r).await;
     });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch/video"))
-        .await
-        .expect("connecting the video websocket");
+    let mut ws = private_sessions::ws_connect_as(&handle, addr).await;
 
     // Wait for at least one real message so the server's forwarding loop is definitely
     // past its initial setup (not still resolving `encoded_video_queue()`), then close
@@ -806,9 +833,7 @@ async fn watch_video_websocket_survives_a_publisher_outage_and_ends_cleanly() {
         }
     });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{http_addr}/api/watch/video"))
-        .await
-        .expect("connecting the video websocket");
+    let mut ws = private_sessions::ws_connect_as(&handle, http_addr).await;
 
     // Everything received, in order, as `(opcode, epoch, is_keyframe)`.
     let mut log: Vec<(u8, u32, bool)> = Vec::new();
@@ -962,7 +987,7 @@ async fn watch_video_websocket_survives_a_publisher_outage_and_ends_cleanly() {
 
     let state = json_body(get(&r, "/api/state").await).await;
     assert_eq!(state["watch"]["finished"], true, "{state}");
-    let res = post(&r, "/api/watch/stop", json!({})).await;
+    let res = stop_as_owner(&handle, &r).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(json_body(res).await["state"], "ready");
 
@@ -1126,18 +1151,37 @@ mod private_sessions {
         .expect("no keyframe arrived");
     }
 
-    pub(super) async fn ws_connect(
+    /// Connect the browser video socket AS THE OWNER of the watch the last `POST /api/watch`
+    /// started: the token travels in `Sec-WebSocket-Protocol`, exactly as the browser does.
+    pub(super) async fn ws_connect_as<
+        D: holochain_moq_node::SessionDirectory + Send + Sync + 'static,
+    >(
+        handle: &AppHandle<D>,
         addr: SocketAddr,
-    ) -> impl futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
     {
-        tokio_tungstenite::connect_async(format!("ws://{addr}/api/watch/video"))
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (_id, token) = handle
+            .registry()
+            .last_issued()
+            .expect("no watch was granted");
+        let mut request = format!("ws://{addr}/api/watch/video")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            format!("moq-watch.v1, moq-watch-token.{token}")
+                .parse()
+                .unwrap(),
+        );
+        tokio_tungstenite::connect_async(request)
             .await
-            .expect("connecting the video websocket")
+            .expect("connecting the owner's video websocket")
             .0
     }
 
     pub(super) async fn stop_watch(v: &Viewer) -> Value {
-        json_body(post(&v.router, "/api/watch/stop", json!({})).await).await
+        json_body(stop_as_owner(&v.handle, &v.router).await).await
     }
 
     pub(super) async fn wait_finished(v: &Viewer, limit: Duration) {
@@ -1174,7 +1218,7 @@ mod private_sessions {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let (addr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         assert_eq!(
             v.proofs.load(Ordering::SeqCst),
@@ -1235,7 +1279,7 @@ mod private_sessions {
 
         let queue = c.handle.app.lock().await.encoded_video_queue().unwrap();
         let (caddr, cserver) = serve(&c.router).await;
-        let mut cws = ws_connect(caddr).await;
+        let mut cws = ws_connect_as(&c.handle, caddr).await;
 
         // The refusal is definitive: the watch ends by itself, quickly - no retry loop.
         wait_finished(&c, Duration::from_secs(30)).await;
@@ -1277,7 +1321,7 @@ mod private_sessions {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let (baddr, bserver) = serve(&b.router).await;
-        let mut bws = ws_connect(baddr).await;
+        let mut bws = ws_connect_as(&b.handle, baddr).await;
         first_keyframe(&mut bws).await;
         assert!(
             b.proofs.load(Ordering::SeqCst) >= 1,
@@ -1296,7 +1340,7 @@ mod private_sessions {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let (aaddr, aserver) = serve(&a.router).await;
-        let mut aws = ws_connect(aaddr).await;
+        let mut aws = ws_connect_as(&a.handle, aaddr).await;
         first_keyframe(&mut aws).await;
 
         drop((bws, aws));
@@ -1569,7 +1613,7 @@ mod private_sessions {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let (haddr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(haddr).await;
+        let mut ws = ws_connect_as(&v.handle, haddr).await;
         first_keyframe(&mut ws).await;
         assert_eq!(
             v.proofs.load(Ordering::SeqCst),
@@ -1668,7 +1712,7 @@ mod private_sessions {
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         let (haddr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(haddr).await;
+        let mut ws = ws_connect_as(&v.handle, haddr).await;
         first_keyframe(&mut ws).await;
 
         first.kill().await;
@@ -1709,7 +1753,7 @@ static SHARE_PORT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 mod lifecycle {
     use super::private_sessions::{
         first_keyframe, frames_until_close, keypair, publisher, serve, stop_watch, viewer,
-        wait_finished, ws_connect,
+        wait_finished, ws_connect_as,
     };
     use super::*;
     use holochain_moq_app::AccessConfig;
@@ -1913,8 +1957,8 @@ mod lifecycle {
         );
         let (baddr, bserver) = serve(&b.router).await;
         let (caddr, cserver) = serve(&c.router).await;
-        let mut bws = ws_connect(baddr).await;
-        let mut cws = ws_connect(caddr).await;
+        let mut bws = ws_connect_as(&b.handle, baddr).await;
+        let mut cws = ws_connect_as(&c.handle, caddr).await;
         first_keyframe(&mut bws).await;
         first_keyframe(&mut cws).await;
         poll(
@@ -1960,7 +2004,7 @@ mod lifecycle {
             StatusCode::OK
         );
         let (baddr2, bserver2) = serve(&b.router).await;
-        let mut bws2 = ws_connect(baddr2).await;
+        let mut bws2 = ws_connect_as(&b.handle, baddr2).await;
         first_keyframe(&mut bws2).await;
 
         // --- The publisher STOPS: the session ends for everybody, cleanly. ---
@@ -2004,7 +2048,7 @@ mod lifecycle {
             )
             .await;
             assert_eq!(res.status(), StatusCode::OK, "cycle {i}");
-            let mut ws = ws_connect(addr).await;
+            let mut ws = ws_connect_as(&v.handle, addr).await;
             first_keyframe(&mut ws).await;
             assert_eq!(
                 v.handle.liveness.video_sockets_open(),
@@ -2064,7 +2108,7 @@ mod lifecycle {
                 json!({"session_id": first_id.to_string()}),
             )
             .await;
-            let mut ws = ws_connect(addr).await;
+            let mut ws = ws_connect_as(&v.handle, addr).await;
             first_keyframe(&mut ws).await;
             drop(ws);
             assert_eq!(stop_watch(&v).await["last_notice"], "left");
@@ -2132,7 +2176,7 @@ mod lifecycle {
             json!({"session_id": second_id.to_string()}),
         )
         .await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let state = json_body(get(&v.router, "/api/state").await).await;
         assert_eq!(state["watch"]["session_id"], second_id.to_string());
@@ -2167,7 +2211,7 @@ mod lifecycle {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         tokio::time::sleep(Duration::from_millis(2000)).await;
         assert!(
@@ -2229,7 +2273,7 @@ mod lifecycle {
         )
         .await;
 
-        let mut old = ws_connect(addr).await;
+        let mut old = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut old).await;
 
         // "Refresh": the server-side state is intact and describes the same watch...
@@ -2237,7 +2281,7 @@ mod lifecycle {
         assert_eq!(state["state"], "watching");
         assert_eq!(state["watch"]["session_id"], id.to_string());
         // ...and the reloaded page opens a new socket. The old one is told it was superseded.
-        let mut fresh = ws_connect(addr).await;
+        let mut fresh = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut fresh).await;
         let (_frames, closed) = frames_until_close(&mut old, Duration::from_secs(10)).await;
         assert!(closed, "the superseded socket must close");
@@ -2312,10 +2356,15 @@ mod lifecycle {
         )
         .await;
         let (addr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
 
-        dropped_after_1ms(&v.router, "/api/watch/stop").await;
+        let (watch_id, token) = v.handle.registry().last_issued().unwrap();
+        let _ = tokio::time::timeout(
+            Duration::ZERO,
+            post_bearer(&v.router, &format!("/api/watch/{watch_id}/stop"), &token),
+        )
+        .await;
 
         poll(
             "the viewer to settle at Ready",
@@ -2346,7 +2395,7 @@ mod observability {
     use super::lifecycle_support::*;
     use super::private_sessions::{
         first_keyframe, frames_until_close, keypair, publisher, serve, start_raw_private_publisher,
-        stop_watch, viewer, wait_finished, ws_connect,
+        stop_watch, viewer, wait_finished, ws_connect_as,
     };
     use super::*;
     use holochain_moq_app::lifecycle::{OpKind, OpSnapshot};
@@ -2369,7 +2418,7 @@ mod observability {
         )
         .await;
         let (addr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
 
         // The operation is visible, live, and past every pre-dial boundary.
@@ -2497,7 +2546,7 @@ mod observability {
         )
         .await;
         let (addr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -2539,7 +2588,7 @@ mod observability {
         )
         .await;
         let (addr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -2554,7 +2603,7 @@ mod observability {
         poll_event(&v, &end.id, "ws.closed").await;
         let end = v.handle.lifecycle.snapshot(&end.id).unwrap();
         assert!(
-            has_detail(&end, "ws.closed", "queue_inactive"),
+            has_detail(&end, "ws.closed", "watch_not_current"),
             "{:?}",
             detail_of(&end, "ws.closed")
         );
@@ -2577,9 +2626,9 @@ mod observability {
         )
         .await;
         let (addr, server) = serve(&v.router).await;
-        let mut old = ws_connect(addr).await;
+        let mut old = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut old).await;
-        let mut fresh = ws_connect(addr).await;
+        let mut fresh = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut fresh).await;
         let (_f, closed) = frames_until_close(&mut old, Duration::from_secs(10)).await;
         assert!(closed);
@@ -2646,7 +2695,7 @@ mod observability {
 
         post(&r, "/api/watch", json!({"session_id": id.to_string()})).await;
         poll_state_finished(&r).await;
-        let end = json_body(post(&r, "/api/watch/stop", json!({})).await).await;
+        let end = json_body(stop_as_owner(&handle, &r).await).await;
         assert_eq!(end["last_error_kind"], "unauthorized");
 
         let op = handle
@@ -2986,7 +3035,7 @@ mod observability {
         assert_eq!(end.terminal, Some("watch.abandoned"));
         assert_eq!(end.failure_kind, Some("abandoned"));
         let why = detail_of(&end, "watch.abandoned").join(" ");
-        assert!(why.contains("no page contact for"), "{why}");
+        assert!(why.contains("no owner contact for"), "{why}");
         assert!(
             why.contains("limit 800ms"),
             "the policy in force is recorded: {why}"
@@ -3026,7 +3075,7 @@ mod observability {
         )
         .await;
         let (haddr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(haddr).await;
+        let mut ws = ws_connect_as(&v.handle, haddr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -3103,7 +3152,7 @@ mod observability {
         )
         .await;
         let (addr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -3147,7 +3196,7 @@ mod observability {
         // (a) Watch -> keyframe -> Leave, repeated.
         for i in 0..8 {
             post(&v.router, "/api/watch", body.clone()).await;
-            let mut ws = ws_connect(addr).await;
+            let mut ws = ws_connect_as(&v.handle, addr).await;
             first_keyframe(&mut ws).await;
             drop(ws);
             stop_watch(&v).await;
@@ -3521,7 +3570,7 @@ mod hardening {
     #[tokio::test]
     async fn a_cross_site_post_cannot_stop_a_share_or_watch() {
         let r = router(AppHandle::new(ready_app().await));
-        for path in ["/api/share/stop", "/api/watch/stop"] {
+        for path in ["/api/share/stop", "/api/watch/some-watch/stop"] {
             let s = request_with(
                 &r,
                 "POST",
@@ -3565,14 +3614,17 @@ mod hardening {
             Err(Error::Http(res)) => assert_eq!(res.status(), 403),
             other => panic!("the cross-origin websocket handshake must be refused, got {other:?}"),
         }
-        // The same handshake from the app's own origin is not refused by the guard (it is
-        // closed by the route itself, because there is no active watch).
+        // The same handshake from the app's own origin passes the Host/Origin guard; the route
+        // itself then refuses it (401: no watch token) - the guard is not authentication.
         let mut ok = format!("ws://{addr}/api/watch/video")
             .into_client_request()
             .unwrap();
         ok.headers_mut()
             .insert("origin", format!("http://{addr}").parse().unwrap());
-        assert!(tokio_tungstenite::connect_async(ok).await.is_ok());
+        match tokio_tungstenite::connect_async(ok).await {
+            Err(Error::Http(res)) => assert_eq!(res.status(), 401),
+            other => panic!("a same-origin socket without a token must get 401, got {other:?}"),
+        }
         server.abort();
     }
 
@@ -3638,7 +3690,7 @@ mod resources {
     use super::lifecycle_support::*;
     use super::private_sessions::{
         first_keyframe, frames_until_close, keypair, publisher, serve, start_raw_private_publisher,
-        stop_watch, viewer, wait_finished, ws_connect, Viewer,
+        stop_watch, viewer, wait_finished, ws_connect_as, Viewer,
     };
     use super::*;
     use crate::diag::ResourceView;
@@ -3686,7 +3738,7 @@ mod resources {
         )
         .await;
         assert_eq!(res_.status(), StatusCode::OK);
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let live = res(v).await;
         drop(ws);
@@ -3850,11 +3902,11 @@ mod resources {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut first = ws_connect(addr).await;
+        let mut first = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut first).await;
         // A second socket supersedes the first: the old one is closed by the server and only
         // one stays counted.
-        let mut second = ws_connect(addr).await;
+        let mut second = ws_connect_as(&v.handle, addr).await;
         let (_, first_closed) = frames_until_close(&mut first, Duration::from_secs(10)).await;
         assert!(
             first_closed,
@@ -3905,7 +3957,7 @@ mod resources {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -4018,7 +4070,7 @@ mod resources {
         )
         .await;
         let (haddr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(haddr).await;
+        let mut ws = ws_connect_as(&v.handle, haddr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -4136,7 +4188,7 @@ mod resources {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let began = std::time::Instant::now();
         assert!(crate::routes::shutdown_app(&v.handle, SHUTDOWN_LIMIT).await);
@@ -4177,7 +4229,7 @@ mod resources {
         )
         .await;
         let (haddr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(haddr).await;
+        let mut ws = ws_connect_as(&v.handle, haddr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
         first.kill().await;
@@ -4212,7 +4264,7 @@ mod resources {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -4248,8 +4300,8 @@ mod resources {
 mod soak {
     use super::lifecycle_support::*;
     use super::private_sessions::{
-        first_keyframe, keypair, publisher, serve, stop_watch, viewer, wait_finished, ws_connect,
-        Viewer,
+        first_keyframe, keypair, publisher, serve, stop_watch, viewer, wait_finished,
+        ws_connect_as, Viewer,
     };
     use super::resources::{res, settle, watch_cycle};
     use super::*;
@@ -4470,7 +4522,7 @@ mod soak {
                 .to_string();
             let started = post(&v.router, "/api/watch", json!({"session_id": id})).await;
             assert_eq!(started.status(), StatusCode::OK, "cycle {i}");
-            let mut ws = ws_connect(addr).await;
+            let mut ws = ws_connect_as(&v.handle, addr).await;
             first_keyframe(&mut ws).await;
             let watch_id = newest(&v, OpKind::Watch).id;
             let stopped = post(&pub_router, "/api/share/stop", json!({})).await;
@@ -4555,7 +4607,7 @@ mod soak {
         )
         .await;
         let (haddr, server) = serve(&v.router).await;
-        let mut ws = ws_connect(haddr).await;
+        let mut ws = ws_connect_as(&v.handle, haddr).await;
         let mut floor = 0u32;
         keyframe_of_epoch(&mut ws, 0, &mut floor).await;
         let watch_id = newest(&v, OpKind::Watch).id;
@@ -4635,7 +4687,7 @@ mod soak {
             )
             .await;
             let (haddr, server) = serve(&v.router).await;
-            let mut ws = ws_connect(haddr).await;
+            let mut ws = ws_connect_as(&v.handle, haddr).await;
             first_keyframe(&mut ws).await;
             let watch_id = newest(&v, OpKind::Watch).id;
 
@@ -4728,7 +4780,7 @@ mod soak {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut bws = ws_connect(baddr).await;
+        let mut bws = ws_connect_as(&bob_v.handle, baddr).await;
         first_keyframe(&mut bws).await;
         let bob_watch = newest(&bob_v, OpKind::Watch).id;
         let mut floor = 0u32;
@@ -4805,7 +4857,7 @@ mod soak {
         .await;
         let watch_id = newest(&v, OpKind::Watch).id;
         for i in 0..CHURN {
-            let mut ws = ws_connect(addr).await;
+            let mut ws = ws_connect_as(&v.handle, addr).await;
             first_keyframe(&mut ws).await;
             assert_eq!(res(&v).await.video_sockets_open, 1, "attach {i}");
             drop(ws); // a "refresh" / closed tab: the socket goes, the Watch stays
@@ -4836,7 +4888,7 @@ mod soak {
             "{unread:?}"
         );
         // ...and a replacement socket attaches normally afterwards.
-        let mut again = ws_connect(addr).await;
+        let mut again = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut again).await;
         let snap = v.handle.lifecycle.snapshot(&watch_id).unwrap();
         assert_eq!(count(&snap, "watch.reconnecting"), 0);
@@ -4865,7 +4917,7 @@ mod soak {
 
 mod media_quality {
     use super::private_sessions::{
-        first_keyframe, keypair, publisher, serve, stop_watch, viewer, ws_connect,
+        first_keyframe, keypair, publisher, serve, stop_watch, viewer, ws_connect_as,
     };
     use super::*;
     use holochain_moq_app::AccessConfig;
@@ -4886,7 +4938,7 @@ mod media_quality {
             json!({"session_id": id.to_string()}),
         )
         .await;
-        let mut ws = ws_connect(addr).await;
+        let mut ws = ws_connect_as(&v.handle, addr).await;
         first_keyframe(&mut ws).await;
         // A few more objects so rates and averages exist.
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -5006,5 +5058,508 @@ mod media_quality {
         let mut p = publ_handle.app.lock().await;
         p.request_stop();
         let _ = p.finish_share().await;
+    }
+}
+
+// ---- watch ownership: the scoped, token-authorised stop and owner-only attendance ----
+
+mod ownership {
+    use super::private_sessions::{
+        first_keyframe, keypair, publisher, serve, viewer, ws_connect_as,
+    };
+    use super::*;
+    use futures::StreamExt;
+    use holochain_moq_app::AccessConfig;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// Start a watch over HTTP and return its `(watch_id, watch_token)` from the response body
+    /// - the only place the token is ever delivered.
+    async fn start(v: &private_sessions::Viewer, session: &str) -> (String, String) {
+        let res = post(&v.router, "/api/watch", json!({ "session_id": session })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        (
+            body["watch"]["watch_id"]
+                .as_str()
+                .expect("watch_id")
+                .to_string(),
+            body["watch_token"]
+                .as_str()
+                .expect("watch_token")
+                .to_string(),
+        )
+    }
+    async fn stop(v: &private_sessions::Viewer, id: &str, token: &str) -> axum::response::Response {
+        post_bearer(&v.router, &format!("/api/watch/{id}/stop"), token).await
+    }
+    async fn state(v: &private_sessions::Viewer) -> Value {
+        json_body(get(&v.router, "/api/state").await).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn starting_a_watch_issues_a_unique_identity_and_a_secret_shown_only_once() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "own-issue", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+
+        let (id1, tok1) = start(&v, &sid.to_string()).await;
+        assert_eq!(tok1.len(), 64, "256-bit token as hex");
+        let s = state(&v).await;
+        assert_eq!(s["watch"]["watch_id"], id1.as_str());
+        assert_eq!(
+            s["watch"]["session_id"],
+            sid.to_string(),
+            "the watch is tied to its session"
+        );
+        assert!(
+            s.get("watch_token").is_none(),
+            "GET /api/state must never carry the token: {s}"
+        );
+        assert!(!s.to_string().contains(&tok1));
+
+        assert_eq!(stop(&v, &id1, &tok1).await.status(), StatusCode::OK);
+        let (id2, tok2) = start(&v, &sid.to_string()).await;
+        assert_ne!(id1, id2, "every attempt has its own watch id");
+        assert_ne!(tok1, tok2, "...and its own token");
+        assert_eq!(stop(&v, &id2, &tok2).await.status(), StatusCode::OK);
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_needs_the_right_watch_and_the_right_token() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "own-auth", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+
+        // no credentials
+        let res = post(&v.router, &format!("/api/watch/{id}/stop"), json!({})).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // the public session id is NOT authority
+        assert_eq!(
+            stop(&v, &id, &sid.to_string()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // a guessed / another watch's token
+        assert_eq!(
+            stop(&v, &id, &"0".repeat(64)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // a watch that does not exist
+        assert_eq!(
+            stop(&v, "00000000-0000-0000-0000-000000000000", &tok)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        // the removed unscoped stop says so instead of stopping anything
+        assert_eq!(
+            post(&v.router, "/api/watch/stop", json!({})).await.status(),
+            StatusCode::GONE
+        );
+        // ...and every refusal left the watch running
+        assert_eq!(state(&v).await["state"], "watching");
+
+        let ok = stop(&v, &id, &tok).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(json_body(ok).await["state"], "ready");
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_stops_are_idempotent_and_a_late_stop_never_reaches_a_newer_watch() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "own-stale", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (id1, tok1) = start(&v, &sid.to_string()).await;
+
+        let first = json_body(stop(&v, &id1, &tok1).await).await;
+        assert_eq!(first["state"], "ready");
+        // a duplicate (pagehide racing Leave, a retry): same answer, no error
+        let again = stop(&v, &id1, &tok1).await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(json_body(again).await, first);
+
+        // a NEW watch begins; the old watch's credentials arrive late
+        let (id2, tok2) = start(&v, &sid.to_string()).await;
+        let late = stop(&v, &id1, &tok1).await;
+        assert_eq!(late.status(), StatusCode::OK, "replayed, harmless");
+        let s = state(&v).await;
+        assert_eq!(
+            s["state"], "watching",
+            "the newer watch must be untouched: {s}"
+        );
+        assert_eq!(s["watch"]["watch_id"], id2.as_str());
+        // credentials cannot be crossed between the two watches
+        assert_eq!(stop(&v, &id2, &tok1).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(stop(&v, &id1, &tok2).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state(&v).await["state"], "watching");
+
+        assert_eq!(stop(&v, &id2, &tok2).await.status(), StatusCode::OK);
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_stops_for_one_watch_all_succeed_with_one_ending() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "own-concurrent", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let (a, b, c) = tokio::join!(
+            stop(&v, &id, &tok),
+            stop(&v, &id, &tok),
+            stop(&v, &id, &tok)
+        );
+        for r in [a, b, c] {
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        assert_eq!(state(&v).await["state"], "ready");
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_only_polls_cannot_keep_an_orphaned_watch_alive() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "own-orphan", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let dog = crate::routes::spawn_abandoned_watch_watchdog(
+            v.handle.clone(),
+            Duration::from_millis(800),
+            Duration::from_millis(100),
+        );
+        let (id, tok) = start(&v, &sid.to_string()).await;
+
+        // The OWNER polling with its token keeps the watch (a hidden tab's timers included).
+        for _ in 0..25 {
+            post_get_bearer(&v, &tok).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            state(&v).await["state"],
+            "watching",
+            "an attended watch was left"
+        );
+
+        // The owner goes away (browser killed, proxy restarted and token lost). A stale page
+        // keeps polling anonymously - which used to preserve the orphan forever.
+        let started = tokio::time::Instant::now();
+        loop {
+            if state(&v).await["state"] == "ready" {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "anonymous polling kept an orphaned watch alive"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The owner's token still gets a clean, idempotent answer afterwards.
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        dog.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    async fn post_get_bearer(v: &private_sessions::Viewer, token: &str) {
+        let res = v
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    type WsErr = tokio_tungstenite::tungstenite::Error;
+
+    /// Try to open the video socket offering `token` (None = no sub-protocol at all). `Err` is
+    /// the HTTP status the server refused the UPGRADE with.
+    async fn try_ws(
+        addr: SocketAddr,
+        token: Option<&str>,
+    ) -> Result<impl futures::Stream<Item = Result<WsMessage, WsErr>> + Unpin, StatusCode> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}/api/watch/video")
+            .into_client_request()
+            .unwrap();
+        if let Some(t) = token {
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                format!("moq-watch.v1, moq-watch-token.{t}")
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(WsErr::Http(res)) => Err(res.status()),
+            Err(e) => panic!("unexpected websocket error: {e:?}"),
+        }
+    }
+
+    /// Frames received in `window`, and whether the socket was closed/ended by the server.
+    async fn drain(
+        ws: &mut (impl futures::Stream<Item = Result<WsMessage, WsErr>> + Unpin),
+        window: Duration,
+    ) -> (usize, Option<u16>, bool) {
+        let mut frames = 0;
+        let mut code = None;
+        let ended = tokio::time::timeout(window, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Binary(_))) => frames += 1,
+                    Some(Ok(WsMessage::Close(Some(f)))) => code = Some(u16::from(f.code)),
+                    Some(Ok(_)) => {}
+                    _ => return,
+                }
+            }
+        })
+        .await
+        .is_ok();
+        (frames, code, ended)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_video_socket_is_refused_before_upgrade_without_the_active_watchs_token() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "ws-auth", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+
+        // No active watch: fail closed, whatever is presented.
+        assert_eq!(
+            try_ws(addr, None).await.err(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            try_ws(addr, Some(&"a".repeat(64))).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        assert_eq!(
+            try_ws(addr, None).await.err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "no token"
+        );
+        for malformed in ["x", "not-hex", &"A".repeat(64), &sid.to_string()] {
+            assert_eq!(
+                try_ws(addr, Some(malformed)).await.err(),
+                Some(StatusCode::UNAUTHORIZED),
+                "malformed {malformed}"
+            );
+        }
+        assert_eq!(
+            try_ws(addr, Some(&"0".repeat(64))).await.err(),
+            Some(StatusCode::FORBIDDEN),
+            "well-formed but wrong"
+        );
+        let mut ok = try_ws(addr, Some(&tok))
+            .await
+            .expect("the owner is admitted");
+        first_keyframe(&mut ok).await;
+        assert_eq!(v.handle.liveness.video_sockets_open(), 1);
+
+        // Expired: once the watch is stopped its token is dead.
+        drop(ok);
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        assert_eq!(
+            try_ws(addr, Some(&tok)).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // Previous watch's token cannot attach to a newer watch.
+        let (_id2, tok2) = start(&v, &sid.to_string()).await;
+        assert_ne!(tok, tok2);
+        assert_eq!(
+            try_ws(addr, Some(&tok)).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert!(try_ws(addr, Some(&tok2)).await.is_ok());
+
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unauthorised_sockets_get_no_frames_and_cannot_disturb_the_owner() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        // A PRIVATE session the viewer is allowed into.
+        let (mut publ, sid) = publisher(
+            &dir,
+            &alice,
+            "ws-private",
+            AccessConfig::allowed(vec![bob.clone()]).unwrap(),
+        )
+        .await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let mut owner = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut owner).await;
+        let generation_before = v.handle.liveness.video_sockets_open();
+
+        // Concurrent attackers (anonymous, wrong token, a session id) alongside the owner.
+        let attackers = (0..8).map(|i| {
+            tokio::spawn(async move {
+                let wrong = "1".repeat(64);
+                match i % 3 {
+                    0 => try_ws(addr, None).await.err(),
+                    1 => try_ws(addr, Some(&wrong)).await.err(),
+                    _ => try_ws(addr, Some("00000000-0000-0000-0000-000000000000"))
+                        .await
+                        .err(),
+                }
+            })
+        });
+        for a in futures::future::join_all(attackers).await {
+            let status = a.unwrap().expect("an unauthorised socket must be refused");
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+                "{status}"
+            );
+        }
+        // The owner is not superseded, still registered, and keeps receiving the stream.
+        assert_eq!(v.handle.liveness.video_sockets_open(), generation_before);
+        let (frames, code, ended) = drain(&mut owner, Duration::from_secs(2)).await;
+        assert!(frames > 0, "the owner kept receiving frames");
+        assert!(
+            !ended && code.is_none(),
+            "the owner was not closed ({code:?})"
+        );
+
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_owner_can_reconnect_and_only_then_is_the_old_socket_replaced() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "ws-reconnect", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let mut old = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut old).await;
+        assert!(try_ws(addr, None).await.is_err());
+        let mut fresh = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut fresh).await;
+        let (_frames, code, ended) = drain(&mut old, Duration::from_secs(5)).await;
+        assert!(ended, "the superseded owner socket was closed");
+        assert_eq!(code, Some(4009));
+        assert_eq!(v.handle.liveness.video_sockets_open(), 1);
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_socket_stops_receiving_the_moment_its_watch_ends_and_never_follows_a_newer_one() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "ws-ends", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        let mut a = try_ws(addr, Some(&tok)).await.unwrap();
+        first_keyframe(&mut a).await;
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        // A new watch begins at once; the old socket must not become its consumer.
+        let (_id2, tok2) = start(&v, &sid.to_string()).await;
+        let mut b = try_ws(addr, Some(&tok2)).await.unwrap();
+        first_keyframe(&mut b).await;
+        let (_frames, _code, ended) = drain(&mut a, Duration::from_secs(5)).await;
+        assert!(ended, "the old watch's socket was closed");
+        // ...and no frame of the new watch ever went to it: B still receives the stream.
+        let (frames, _c, b_ended) = drain(&mut b, Duration::from_secs(2)).await;
+        assert!(frames > 0 && !b_ended);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_owners_video_socket_counts_as_attending() {
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(&dir, &alice, "own-socket", AccessConfig::Public).await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (addr, server) = serve(&v.router).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+
+        // A foreign page's socket is refused outright; it never attends.
+        assert!(try_ws(addr, None).await.is_err());
+        assert_eq!(v.handle.liveness.video_sockets_open(), 0);
+        // The owner's socket does.
+        let mut owner = ws_connect_as(&v.handle, addr).await;
+        first_keyframe(&mut owner).await;
+        assert_eq!(v.handle.liveness.video_sockets_open(), 1);
+
+        drop(owner);
+        assert_eq!(stop(&v, &id, &tok).await.status(), StatusCode::OK);
+        server.abort();
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_that_ended_on_its_own_still_reports_its_error_to_its_owner_only() {
+        // A refused (private) watch finishes by itself; the OWNER learns why via its stop.
+        let (_ak, alice) = keypair(1);
+        let (bk, bob) = keypair(2);
+        let dir = InMemoryPeerDirectory::new(alice.clone());
+        let (mut publ, sid) = publisher(
+            &dir,
+            &alice,
+            "own-denied",
+            AccessConfig::allowed(vec![alice.clone()]).unwrap(),
+        )
+        .await;
+        let v = viewer(&dir, bk, &bob).await;
+        let (id, tok) = start(&v, &sid.to_string()).await;
+        private_sessions::wait_finished(&v, Duration::from_secs(20)).await;
+        assert_eq!(
+            stop(&v, &id, "f".repeat(64).as_str()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let end = json_body(stop(&v, &id, &tok).await).await;
+        assert_eq!(end["last_error_kind"], "unauthorized", "{end}");
+        let repeat = json_body(stop(&v, &id, &tok).await).await;
+        assert_eq!(repeat, end, "a repeat replays the same outcome");
+        publ.request_stop();
+        publ.finish_share().await.unwrap();
     }
 }

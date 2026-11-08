@@ -2,7 +2,8 @@
 
 use super::{detached, detached_op, ensure_ready, ApiError, AppHandle};
 use crate::view::{error_kind, sessions_view, watch_end_notice, AppStateView, SessionView};
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap};
 use axum::Json;
 use holochain_moq_app::lifecycle::{OpId, OpKind};
 use holochain_moq_node::{RetryPolicy, SessionDirectory};
@@ -102,7 +103,22 @@ async fn watch_inner<D: SessionDirectory + Send + Sync + 'static>(
         .start_watch_encoded(session_id, RetryPolicy::default(), ENCODED_QUEUE_CAPACITY)
         .await
     {
-        Ok(_queue) => Ok(Json(AppStateView::from_app(&app))),
+        Ok(_queue) => {
+            // Mint this watch's identity and its bearer token. The token is returned HERE,
+            // once, and is never part of `GET /api/state`; `session_id` is public and is
+            // never authority.
+            let (watch_id, token) = handle.registry().issue(&session_id.to_string());
+            if let Some(op) = app.watch_op() {
+                handle
+                    .lifecycle
+                    .event(&op, "watch.granted", Some(format!("watch_id={watch_id}")));
+            }
+            Ok(Json(
+                AppStateView::from_app(&app)
+                    .with_watch_id(Some(&watch_id))
+                    .with_watch_token(token),
+            ))
+        }
         Err(e) => {
             ensure_ready(&mut app).await;
             Err(ApiError::from(e))
@@ -110,16 +126,100 @@ async fn watch_inner<D: SessionDirectory + Send + Sync + 'static>(
     }
 }
 
+/// The removed unscoped stop. Answers clearly rather than 404 so an old client learns why.
+pub async fn post_watch_stop_removed() -> ApiError {
+    ApiError::gone(
+        "POST /api/watch/stop was removed: use POST /api/watch/{watch_id}/stop with \
+         `Authorization: Bearer <watch_token>` (both returned by POST /api/watch)",
+    )
+}
+
+/// Record how the active watch ended so a repeated or late stop for it replays the same
+/// answer, and return that answer. Used by every path that ends a watch (stop, watchdog).
+pub(crate) fn end_current_watch<D: SessionDirectory + Send + Sync + 'static>(
+    handle: &AppHandle<D>,
+    app: &holochain_moq_app::App<D>,
+    finished: anyhow::Result<holochain_moq_screenshare::PlayEnd>,
+) -> AppStateView {
+    let view = match finished {
+        Ok(end) => AppStateView::from_app(app).with_notice(watch_end_notice(end)),
+        Err(e) => AppStateView::from_app(app)
+            .with_last_error(format!("{e:#}"))
+            .with_error_kind(error_kind(&e)),
+    };
+    handle
+        .registry()
+        .end_current(serde_json::to_value(&view).unwrap_or(serde_json::Value::Null));
+    view
+}
+
+/// `POST /api/watch/{watch_id}/stop` with `Authorization: Bearer <watch_token>`.
+///
+/// * missing/malformed credentials: 401; wrong token for that watch: 403; unknown watch: 404;
+/// * the active watch with its token: stop it (strictly local - never touches the publisher);
+/// * a watch that already ended, with its token: 200, replaying the ending result - so a
+///   repeated stop (pagehide racing Leave, a retry) is safe, and a LATE stop can never
+///   reach a newer watch because it is matched to its own watch id and token only.
 pub async fn post_watch_stop<D: SessionDirectory + Send + Sync + 'static>(
     State(handle): State<AppHandle<D>>,
-) -> Result<Json<AppStateView>, ApiError> {
-    detached(watch_stop_inner(handle)).await
+    Path(watch_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::ownership::{bearer, StopCheck};
+    let Some(token) = bearer(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    ) else {
+        return Err(ApiError::unauthorized(
+            "stopping a watch needs `Authorization: Bearer <watch_token>`",
+        ));
+    };
+    let token = token.to_string();
+    // Cheap rejections and replays never wait for the app lock.
+    match handle.registry().check_stop(&watch_id, &token) {
+        StopCheck::Unknown => {
+            return Err(ApiError::not_found(
+                "no such watch (it may have ended long ago)",
+            ))
+        }
+        StopCheck::BadToken => {
+            tracing::warn!(%watch_id, "rejected a stop with the wrong token");
+            return Err(ApiError::forbidden("that token does not own this watch"));
+        }
+        StopCheck::AlreadyEnded(view) => return Ok(Json(view)),
+        StopCheck::Current => {}
+    }
+    detached(watch_stop_inner(handle, watch_id, token)).await
 }
 
 async fn watch_stop_inner<D: SessionDirectory + Send + Sync + 'static>(
     handle: AppHandle<D>,
-) -> Result<Json<AppStateView>, ApiError> {
+    watch_id: String,
+    token: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::ownership::StopCheck;
     let mut app = handle.app.lock().await;
+    // Re-checked under the app lock: a concurrent stop or the watchdog may have ended this
+    // watch (or a newer one begun) while this request waited.
+    match handle.registry().check_stop(&watch_id, &token) {
+        StopCheck::Current => {}
+        StopCheck::AlreadyEnded(view) => return Ok(Json(view)),
+        StopCheck::BadToken => {
+            return Err(ApiError::forbidden("that token does not own this watch"))
+        }
+        StopCheck::Unknown => return Err(ApiError::not_found("no such watch")),
+    }
+    // Defence in depth: the grant records which session this watch was started for; the app's
+    // active watch must still be exactly that one, or nothing is stopped.
+    let granted = handle.registry().current_session_id().map(str::to_owned);
+    if let Some(active) = app.watch_session_id() {
+        if granted.as_deref() != Some(active.to_string().as_str()) {
+            return Err(ApiError::conflict(
+                "the active watch is not the one this token was issued for",
+            ));
+        }
+    }
     let op = app.watch_op();
     let started = std::time::Instant::now();
     if let Some(op) = &op {
@@ -127,7 +227,13 @@ async fn watch_stop_inner<D: SessionDirectory + Send + Sync + 'static>(
     }
 
     if !app.request_stop_watch() {
-        return Err(ApiError::bad_request("no active watch to stop"));
+        // This owner's watch is gone from the app already (nothing left to stop): settle the
+        // grant so repeats are idempotent, and report the app as it is.
+        let view = AppStateView::from_app(&app);
+        handle
+            .registry()
+            .end_current(serde_json::to_value(&view).unwrap_or(serde_json::Value::Null));
+        return Ok(Json(serde_json::to_value(view).unwrap_or_default()));
     }
 
     // Blocks only until the background task reports (immediately, if it had already
@@ -141,14 +247,6 @@ async fn watch_stop_inner<D: SessionDirectory + Send + Sync + 'static>(
             Some(format!("{}ms", started.elapsed().as_millis())),
         );
     }
-    match finished {
-        Ok(end) => Ok(Json(
-            AppStateView::from_app(&app).with_notice(watch_end_notice(end)),
-        )),
-        Err(e) => Ok(Json(
-            AppStateView::from_app(&app)
-                .with_last_error(format!("{e:#}"))
-                .with_error_kind(error_kind(&e)),
-        )),
-    }
+    let view = end_current_watch(&handle, &app, finished);
+    Ok(Json(serde_json::to_value(view).unwrap_or_default()))
 }
